@@ -29,3 +29,4 @@ inngest.fast_api.serve(
     inngest_client,
     [rag_ingest_pdf]
 )
+
