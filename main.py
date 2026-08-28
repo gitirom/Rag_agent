@@ -1,11 +1,14 @@
 import logging
 import uuid
+import datetime
+import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 
 import inngest
 import inngest.fast_api
+from inngest.experimental import ai
 
 from data_loader import load_and_chunk_pdf, embed_texts
 from vector_db import QdrantStorage
@@ -126,6 +129,174 @@ async def rag_ingest_pdf(ctx: inngest.Context):
 
 
 
+@inngest_client.create_function(
+    fn_id="RAG:  Query PDF",
+    trigger=inngest.TriggerEvent(event="rag/query_pdf_ai"),
+)
+
+#top_k = 5: referce to 5 most relevant chunks.
+    # Example of a query and its results:
+    #         Chunk 124 → similarity 0.92
+    #         Chunk 87  → similarity 0.89
+    #         Chunk 421 → similarity 0.86
+    #         Chunk 52  → similarity 0.83
+    #         Chunk 901 → similarity 0.81
+    #  
+
+async def rag_query_pdf_ai(ctx: inngest.Context):
+
+
+    question = ctx.event.data.get("question")
+
+    if not question:
+        raise ValueError(
+            "Missing 'question' in event data."
+        )
+
+    # Number of chunks to retrieve
+    top_k = ctx.event.data.get("top_k", 5)
+
+    # Make sure top_k is reasonable
+    top_k = max(1, min(top_k, 20))
+
+
+    def search_documents() -> RAGSearchResult:
+
+        query_vector = embed_texts(
+            [question]
+        )[0]
+
+        store = QdrantStorage()
+
+        found = store.search(
+            query_vector,
+            top_k=top_k,
+        )
+
+        return RAGSearchResult(
+            contexts=found["contexts"],
+            sources=found["sources"],
+        )
+
+
+    found = await ctx.step.run(
+        "embed-and-search",
+        search_documents,
+        output_type=RAGSearchResult,
+    )
+
+
+
+    if not found.contexts:
+
+        return {
+            "answer": (
+                "I couldn't find relevant information "
+                "in the provided documents."
+            ),
+            "sources": [],
+            "num_contexts": 0,
+        }
+
+
+
+    # 4. Build context
+
+
+    context_block = "\n\n".join(
+        f"- {chunk}"
+        for chunk in found.contexts
+    )
+
+
+    # 5. Build LLM prompt
+
+
+    user_content = f"""
+            Use the following context to answer the question.
+
+            Context:
+            {context_block}
+
+            Question:
+            {question}
+
+            Instructions:
+            - Answer using only the provided context.
+            - Do not use outside knowledge.
+            - If the answer is not contained in the context,
+            say: "I don't have enough information in the provided documents."
+            - Keep the answer concise.
+        """
+
+
+
+    openrouter_api_key = os.getenv(
+        "OPENROUTER_API_KEY"
+    )
+
+    if not openrouter_api_key:
+        raise ValueError(
+            "OPENROUTER_API_KEY is not configured."
+        )
+
+
+    adapter = ai.openai.Adapter(
+        auth_key=openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+        model="minimax/minimax-m3:free",
+    )
+
+
+
+    res = await ctx.step.ai.infer(
+        "llm-answer",
+
+        adapter=adapter,
+
+        body={
+            "max_tokens": 1024,
+
+            "temperature": 0.2,
+
+            "messages": [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a RAG assistant. "
+                        "Answer questions using only "
+                        "the provided context."
+                    ),
+                },
+
+                {
+                    "role": "user",
+                    "content": user_content,
+                },
+            ],
+        },
+    )
+
+
+    # 8. Extract LLM answer
+
+
+    answer = (
+        res["choices"][0]
+        ["message"]
+        ["content"]
+        .strip()
+    )
+
+
+    # 9. Return final RAG result
+
+
+    return {
+        "answer": answer,
+        "sources": found.sources,
+        "num_contexts": len(found.contexts),
+    }
 
 app = FastAPI()
 
@@ -133,5 +304,10 @@ app = FastAPI()
 inngest.fast_api.serve(
     app,
     inngest_client,
-    [rag_ingest_pdf],
+    [rag_ingest_pdf, rag_query_pdf_ai],
 )
+
+
+
+
+

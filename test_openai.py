@@ -15,7 +15,7 @@ client = OpenAI(
 )
 
 response = client.chat.completions.create(
-    model="openrouter/free",
+    model="minimax/minimax-m3:free",
     messages=[
         {
             "role": "user",
